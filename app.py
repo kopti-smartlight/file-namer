@@ -100,12 +100,32 @@ def process_files():
                 print(f"[SKIP] 파일이 아님: {b_file_path}")
                 continue
 
-            suffix = ""
-            if has_middle:
-                suffix = "_M"
-            elif has_high:
-                suffix = "_H"
+            #suffix = ""
+            #if has_middle:
+            #    suffix = "_M"
+            #elif has_high:
+            #    suffix = "_H"
+            
+            # b_file에서 _뒤 숫자 두 자리 추출
+            name_only = os.path.splitext(b_file)[0]
+            match = re.match(r"(.+)_([0-9]{2})$", name_only)
+            if not match:
+                print(f"[SKIP] 이름 형식 안 맞음: {b_file}")
+                continue
 
+            base_name, file_num = match.groups()
+
+            # 해당 번호 포함된 a 파일 중 high/middle 여부 판단
+            suffix = ""
+            for a_file in a_files:
+                if file_num in a_file:
+                    lower_name = a_file.lower()
+                    if "high" in lower_name:
+                        suffix = "_H"
+                    elif "middle" in lower_name:
+                        suffix = "_M"
+                    break  # 일치하는 파일 하나만 확인하면 됨
+            
             name_only = os.path.splitext(b_file)[0]
             match = re.match(r"(.+)_([0-9]{2})$", name_only)
             if not match:
