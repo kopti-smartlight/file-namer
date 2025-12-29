@@ -208,7 +208,7 @@ class App:
         self.root.title("Namer (Safe-Fast)")
 
         self.var_b = tk.StringVar()
-        self.var_a_root = tk.StringVar()
+        self.var_a_root = tk.StringVar(value="Y:/01_원시데이터/동적")
         self.var_out = tk.StringVar()
         self.status_var = tk.StringVar(value="대기 중…")
 
@@ -226,7 +226,7 @@ class App:
 
         # 모드 선택 (rename / copy) — 기본은 rename
         tk.Label(root, text="작업 모드").grid(row=3, column=0, sticky="e", padx=5, pady=5)
-        self.mode_var = tk.StringVar(value="rename")
+        self.mode_var = tk.StringVar(value="copy")
         mode_combo = ttk.Combobox(root, textvariable=self.mode_var, values=["rename", "copy"], state="readonly", width=10)
         mode_combo.grid(row=3, column=1, sticky="w", padx=5)
 
@@ -238,7 +238,18 @@ class App:
 
         tk.Label(root, textvariable=self.status_var).grid(row=6, column=0, columnspan=3, pady=5)
 
-        self._q = queue.Queue()
+        log_frame = tk.Frame(root)
+        log_frame.grid(row=7, column=0, columnspan=3, sticky="nsew", padx=5, pady=5)
+        self.log_text = tk.Text(log_frame, height=10, width=80, state="disabled")
+        self.log_text.pack(side="left", fill="both", expand=True)
+        log_scroll = ttk.Scrollbar(log_frame, command=self.log_text.yview)
+        log_scroll.pack(side="right", fill="y")
+        self.log_text.configure(yscrollcommand=log_scroll.set)
+
+        self.root.grid_columnconfigure(1, weight=1)
+        self.root.grid_rowconfigure(7, weight=1)
+
+        self._log_q = queue.Queue()
         self._stats = {}
         self._work_thread: Optional[threading.Thread] = None
 
@@ -254,17 +265,31 @@ class App:
         folder = filedialog.askdirectory(title="출력 폴더 선택")
         if folder: self.var_out.set(folder)
 
+    def _append_log(self, message: str):
+        self.log_text.configure(state="normal")
+        self.log_text.insert("end", message + "\n")
+        self.log_text.see("end")
+        self.log_text.configure(state="disabled")
+
+    def _log(self, message: str):
+        self._log_q.put(message)
+
     def _ui_tick(self):
-        last_msg = None
         try:
-            while True: last_msg = self._q.get_nowait()
-        except queue.Empty: pass
-        if last_msg: self.status_var.set(last_msg)
+            while True:
+                msg = self._log_q.get_nowait()
+                self._append_log(msg)
+        except queue.Empty:
+            pass
         s = self._stats
-        if s.get("total",0) > 0:
+        if s.get("total", 0) > 0:
             self.progress["maximum"] = s["total"]
             self.progress["value"] = s["processed"]
+            self.status_var.set(
+                f"진행: {s['processed']}/{s['total']} | 성공: {s['copied_ok']} | 스킵: {s['skipped']}"
+            )
         if s.get("done",False):
+            self._append_log("처리 완료!")
             messagebox.showinfo("완료", f"완료: {s['copied_ok']} 성공 / {s['skipped']} 스킵")
             self.run_btn.config(state="normal"); return
         self.root.after(UI_TICK_MS, self._ui_tick)
@@ -279,27 +304,45 @@ class App:
         if not a_date: messagebox.showerror("오류", "원시 날짜 폴더 없음"); return
         files = list(list_all_b_files(b_date)); total = len(files)
         if total==0: messagebox.showinfo("정보","처리할 파일 없음"); return
+        self.log_text.configure(state="normal")
+        self.log_text.delete("1.0", "end")
+        self.log_text.configure(state="disabled")
         self._stats={"total":total,"processed":0,"copied_ok":0,"skipped":0,"done":False}
+        self._append_log("처리 시작...")
         def worker():
             for mode,stop,set_no,b_file in files:
                 nn,base,ext = parse_b_file_num_and_base(b_file)
-                if nn is None: self._stats["skipped"]+=1; self._stats["processed"]+=1; continue
+                if nn is None:
+                    self._stats["skipped"]+=1; self._stats["processed"]+=1
+                    self._log(f"[SKIP] 파일명 번호 추출 실패: {b_file}")
+                    continue
                 if mode=="single":
                     a_single=_find_child_dir_casefold(a_date,"single") or (a_date/"Single")
                     a_set=a_single/set_no
                 else: a_set=a_date/(stop or "0000")/set_no
                 mapping=build_hm_index_for_set(a_set); hm=mapping.get(nn)
-                if hm is None: self._stats["skipped"]+=1; self._stats["processed"]+=1; continue
+                if hm is None:
+                    self._stats["skipped"]+=1; self._stats["processed"]+=1
+                    self._log(f"[SKIP] high/middle 매칭 실패: {b_file} (A: {a_set})")
+                    continue
                 if mode=="single": new=f"{yymmdd}-{set_no}-{base}_{hm}_{nn}{ext}"
                 else: new=f"{yymmdd}-{stop}-{set_no}-{base}_{hm}_{nn}{ext}"
                 out_dir=out_root/yymmdd/nn; out_dir.mkdir(parents=True,exist_ok=True); dest=ensure_unique_path_fast(out_dir/new)
                 if self.mode_var.get()=="rename":
-                    try: b_file.rename(dest); self._stats["copied_ok"]+=1
-                    except: self._stats["skipped"]+=1
+                    try:
+                        b_file.rename(dest); self._stats["copied_ok"]+=1
+                        self._log(f"[RENAME] {b_file} -> {dest}")
+                    except Exception as e:
+                        self._stats["skipped"]+=1
+                        self._log(f"[SKIP] rename 실패: {b_file} -> {dest} ({e})")
                 else:
                     ok=safe_copy2_atomic(b_file,dest)
-                    if ok: self._stats["copied_ok"]+=1
-                    else: self._stats["skipped"]+=1
+                    if ok:
+                        self._stats["copied_ok"]+=1
+                        self._log(f"[COPY] {b_file} -> {dest}")
+                    else:
+                        self._stats["skipped"]+=1
+                        self._log(f"[SKIP] copy 실패: {b_file} -> {dest}")
                 self._stats["processed"]+=1
             self._stats["done"]=True
         self.run_btn.config(state="disabled")
