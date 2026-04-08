@@ -12,7 +12,7 @@ from typing import Dict, Optional, List, Tuple
 
 # -------- 정규식 -------- #
 IMG_NUM_RE = re.compile(r"(?:^|_)(\d{2})(?=\D*$)")
-HM_RE = re.compile(r"(?i)(high|middle|\bh\b|\bm\b)")
+HM_RE = re.compile(r"(?i)(?<![^\W_])(high|middle|low|h|m|l)(?![^\W_])")
 A_NN_END_RE = re.compile(r"_(\d{2})(?=\.[^.]+$)", re.IGNORECASE)
 A_NN_ANY_RE = re.compile(r"(\d{2})(?!\d)")
 
@@ -28,6 +28,8 @@ FSYNC_AFTER_COPY = True
 
 UI_TICK_MS = 50
 UI_MSG_EVERY = 50
+
+LEVEL_PRIORITY = {"L": 0, "M": 1, "H": 2}
 
 # -------- 유틸 -------- #
 def is_date_folder(name: str) -> bool:
@@ -115,10 +117,17 @@ def build_hm_index_for_set(a_set_path: Path) -> Dict[str, str]:
             if not hm_m:
                 continue
             token = hm_m.group(1).lower()
-            val = "H" if token in ("high", "h") else ("M" if token in ("middle", "m") else None)
+            if token in ("high", "h"):
+                val = "H"
+            elif token in ("middle", "m"):
+                val = "M"
+            elif token in ("low", "l"):
+                val = "L"
+            else:
+                val = None
             if not val:
                 continue
-            if nn not in mapping or val == "H":
+            if nn not in mapping or LEVEL_PRIORITY[val] > LEVEL_PRIORITY[mapping[nn]]:
                 mapping[nn] = val
     return mapping
 
@@ -323,7 +332,7 @@ class App:
                 mapping=build_hm_index_for_set(a_set); hm=mapping.get(nn)
                 if hm is None:
                     self._stats["skipped"]+=1; self._stats["processed"]+=1
-                    self._log(f"[SKIP] high/middle 매칭 실패: {b_file} (A: {a_set})")
+                    self._log(f"[SKIP] low/middle/high 매칭 실패: {b_file} (A: {a_set})")
                     continue
                 if mode=="single": new=f"{yymmdd}-{set_no}-{base}_{hm}_{nn}{ext}"
                 else: new=f"{yymmdd}-{stop}-{set_no}-{base}_{hm}_{nn}{ext}"
