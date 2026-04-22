@@ -217,7 +217,8 @@ class App:
         self.root.title("Namer (Safe-Fast)")
 
         self.var_b = tk.StringVar()
-        self.var_a_root = tk.StringVar(value="Y:/01_원시데이터/동적")
+        # self.var_a_root = tk.StringVar(value="Y:/01_원시데이터/동적")
+        self.var_a_root = tk.StringVar(value="X:/01_원시데이터/동적")
         self.var_out = tk.StringVar()
         self.status_var = tk.StringVar(value="대기 중…")
 
