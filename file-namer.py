@@ -6,15 +6,20 @@ import shutil
 import queue
 import threading
 import tkinter as tk
+from dataclasses import dataclass
 from pathlib import Path
 from tkinter import filedialog, messagebox, ttk
-from typing import Dict, Optional, List, Tuple
+from typing import Dict, Iterator, Optional, List, Tuple
 
 # -------- 정규식 -------- #
 IMG_NUM_RE = re.compile(r"(?:^|_)(\d{2})(?=\D*$)")
 HM_RE = re.compile(r"(?i)(?<![^\W_])(high|middle|low|h|m|l)(?![^\W_])")
 A_NN_END_RE = re.compile(r"_(\d{2})(?=\.[^.]+$)", re.IGNORECASE)
 A_NN_ANY_RE = re.compile(r"(\d{2})(?!\d)")
+FLAT_B_FILE_RE = re.compile(
+    r"^(?P<stop>\d{4})_(?P<set_no>\d{4})_"
+    r"(?P<base>.+)_(?P<nn>\d{2})(?P<ext>\.[^.]+)$"
+)
 
 VALID_STOP_RE = re.compile(r"^\d{4}$")
 VALID_SET_RE  = re.compile(r"^\d{4}$")
@@ -32,6 +37,18 @@ UI_MSG_EVERY = 50
 LEVEL_PRIORITY = {"L": 0, "M": 1, "H": 2}
 
 # -------- 유틸 -------- #
+@dataclass(frozen=True)
+class BFileTarget:
+    layout: str
+    mode: str
+    stop: Optional[str]
+    set_no: str
+    path: Path
+    nn: Optional[str]
+    base: Optional[str]
+    ext: Optional[str]
+
+
 def is_date_folder(name: str) -> bool:
     return bool(re.fullmatch(r"\d{6}|\d{8}", name))
 
@@ -59,7 +76,9 @@ def _find_child_dir_casefold(parent: Path, name_cf: str) -> Optional[Path]:
         return None
     return None
 
-def list_all_b_files(b_date_path: Path):
+def _list_legacy_b_files(
+    b_date_path: Path,
+) -> Iterator[Tuple[str, Optional[str], str, Path]]:
     single_dir = _find_child_dir_casefold(b_date_path, "single")
     if single_dir and single_dir.is_dir():
         with os.scandir(single_dir) as it_sets:
@@ -84,7 +103,9 @@ def list_all_b_files(b_date_path: Path):
                                 if f.is_file():
                                     yield ("multi", s.name, d.name, Path(f.path))
 
-def parse_b_file_num_and_base(b_file: Path):
+def parse_b_file_num_and_base(
+    b_file: Path,
+) -> Tuple[Optional[str], Optional[str], Optional[str]]:
     m = IMG_NUM_RE.search(b_file.stem)
     if not m:
         return None, None, None
@@ -94,6 +115,78 @@ def parse_b_file_num_and_base(b_file: Path):
     base = stem[: start - 1] if start > 0 and stem[start - 1] == "_" else stem[: start]
     base = base.rstrip("_")
     return nn, base, b_file.suffix
+
+
+def parse_flat_b_file(b_file: Path) -> Optional[BFileTarget]:
+    match = FLAT_B_FILE_RE.fullmatch(b_file.name)
+    if not match:
+        return None
+    return BFileTarget(
+        layout="flat",
+        mode="multi",
+        stop=match.group("stop"),
+        set_no=match.group("set_no"),
+        path=b_file,
+        nn=match.group("nn"),
+        base=match.group("base"),
+        ext=match.group("ext"),
+    )
+
+
+def list_all_b_files(b_date_path: Path) -> Iterator[BFileTarget]:
+    seen: set[Path] = set()
+    for mode, stop, set_no, b_file in _list_legacy_b_files(b_date_path):
+        nn, base, ext = parse_b_file_num_and_base(b_file)
+        seen.add(b_file)
+        yield BFileTarget(
+            layout="legacy",
+            mode=mode,
+            stop=stop,
+            set_no=set_no,
+            path=b_file,
+            nn=nn,
+            base=base,
+            ext=ext,
+        )
+
+    for root, _, file_names in os.walk(b_date_path):
+        root_path = Path(root)
+        for file_name in file_names:
+            b_file = root_path / file_name
+            if b_file in seen:
+                continue
+            target = parse_flat_b_file(b_file)
+            if target is not None:
+                yield target
+
+
+def build_output_filename(
+    yymmdd: str,
+    mode: str,
+    stop: Optional[str],
+    set_no: str,
+    base: str,
+    hm: str,
+    nn: str,
+    ext: str,
+) -> str:
+    if mode == "single":
+        return f"{yymmdd}-{set_no}-{base}_{hm}_{nn}{ext}"
+    return f"{yymmdd}-{stop}-{set_no}-{base}_{hm}_{nn}{ext}"
+
+
+def build_output_directory(
+    out_root: Path,
+    b_date_path: Path,
+    yymmdd: str,
+    target: BFileTarget,
+) -> Path:
+    if target.layout == "flat":
+        relative_parent = target.path.parent.relative_to(b_date_path)
+        return out_root / yymmdd / relative_parent
+    if target.nn is None:
+        raise ValueError("Legacy target is missing a camera number")
+    return out_root / yymmdd / target.nn
 
 def build_hm_index_for_set(a_set_path: Path) -> Dict[str, str]:
     mapping: Dict[str, str] = {}
@@ -314,15 +407,27 @@ class App:
         if not a_date: messagebox.showerror("오류", "원시 날짜 폴더 없음"); return
         files = list(list_all_b_files(b_date)); total = len(files)
         if total==0: messagebox.showinfo("정보","처리할 파일 없음"); return
+        legacy_count = sum(target.layout == "legacy" for target in files)
+        flat_count = sum(target.layout == "flat" for target in files)
+        operation_mode = self.mode_var.get()
         self.log_text.configure(state="normal")
         self.log_text.delete("1.0", "end")
         self.log_text.configure(state="disabled")
         self._stats={"total":total,"processed":0,"copied_ok":0,"skipped":0,"done":False}
-        self._append_log("처리 시작...")
+        self._append_log(
+            f"처리 시작... (기존 형식: {legacy_count}, 새 형식: {flat_count})"
+        )
         def worker():
-            for mode,stop,set_no,b_file in files:
-                nn,base,ext = parse_b_file_num_and_base(b_file)
-                if nn is None:
+            hm_cache: Dict[Path, Dict[str, str]] = {}
+            for target in files:
+                mode = target.mode
+                stop = target.stop
+                set_no = target.set_no
+                b_file = target.path
+                nn = target.nn
+                base = target.base
+                ext = target.ext
+                if nn is None or base is None or ext is None:
                     self._stats["skipped"]+=1; self._stats["processed"]+=1
                     self._log(f"[SKIP] 파일명 번호 추출 실패: {b_file}")
                     continue
@@ -330,15 +435,24 @@ class App:
                     a_single=_find_child_dir_casefold(a_date,"single") or (a_date/"Single")
                     a_set=a_single/set_no
                 else: a_set=a_date/(stop or "0000")/set_no
-                mapping=build_hm_index_for_set(a_set); hm=mapping.get(nn)
+                mapping = hm_cache.get(a_set)
+                if mapping is None:
+                    mapping = build_hm_index_for_set(a_set)
+                    hm_cache[a_set] = mapping
+                hm=mapping.get(nn)
                 if hm is None:
                     self._stats["skipped"]+=1; self._stats["processed"]+=1
                     self._log(f"[SKIP] low/middle/high 매칭 실패: {b_file} (A: {a_set})")
                     continue
-                if mode=="single": new=f"{yymmdd}-{set_no}-{base}_{hm}_{nn}{ext}"
-                else: new=f"{yymmdd}-{stop}-{set_no}-{base}_{hm}_{nn}{ext}"
-                out_dir=out_root/yymmdd/nn; out_dir.mkdir(parents=True,exist_ok=True); dest=ensure_unique_path_fast(out_dir/new)
-                if self.mode_var.get()=="rename":
+                new = build_output_filename(
+                    yymmdd, mode, stop, set_no, base, hm, nn, ext
+                )
+                out_dir = build_output_directory(
+                    out_root, b_date, yymmdd, target
+                )
+                out_dir.mkdir(parents=True, exist_ok=True)
+                dest = ensure_unique_path_fast(out_dir / new)
+                if operation_mode=="rename":
                     try:
                         b_file.rename(dest); self._stats["copied_ok"]+=1
                         self._log(f"[RENAME] {b_file} -> {dest}")
