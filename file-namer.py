@@ -23,6 +23,10 @@ FLAT_B_FILE_RE = re.compile(
 
 VALID_STOP_RE = re.compile(r"^\d{4}$")
 VALID_SET_RE  = re.compile(r"^\d{4}$")
+# 폴더 이름 속 날짜 덩어리: 앞뒤가 숫자가 아닌 8자리(20YYMMDD) 또는 6자리(YYMMDD)
+DATE_TOKEN_RE = re.compile(r"(?<!\d)(\d{8}|\d{6})(?!\d)")
+# 원시 이미지 이름(Focus 10_Middle_image_02.png): 컨버팅·자동정제 결과(image_02.png)에는 High/Middle/Low 가 없다
+RAW_RANGE_IMAGE_RE = re.compile(r"_(?:high|middle|low)_image_", re.IGNORECASE)
 
 # -------- 옵션 -------- #
 RETRY_MAX = 3
@@ -33,6 +37,10 @@ FSYNC_AFTER_COPY = True
 
 UI_TICK_MS = 50
 UI_MSG_EVERY = 50
+# 화면 갱신 한 번에 넣는 로그 줄 수 상한. rename 은 파일 이동이 거의 즉시 끝나 수천 줄이 한꺼번에 쌓이는데,
+# 그걸 한 tick 에 한 줄씩 넣으면 메인 스레드가 몇 초씩 묶여 "응답 없음"이 된다
+UI_MAX_LINES_PER_TICK = 300
+LOG_MAX_LINES = 5000  # 로그 창에는 최근 줄만 남긴다
 
 LEVEL_PRIORITY = {"L": 0, "M": 1, "H": 2}
 
@@ -52,8 +60,30 @@ class BFileTarget:
 def is_date_folder(name: str) -> bool:
     return bool(re.fullmatch(r"\d{6}|\d{8}", name))
 
-def to_yymmdd(date_folder_name: str) -> str:
-    return date_folder_name[-6:]
+
+def _valid_yymmdd(yymmdd: str) -> bool:
+    month, day = int(yymmdd[2:4]), int(yymmdd[4:6])
+    return 1 <= month <= 12 and 1 <= day <= 31
+
+
+def to_yymmdd(folder_name: str) -> Optional[str]:
+    """폴더 이름 속 날짜(20YYMMDD·YYMMDD 덩어리)를 YYMMDD 로 돌려준다.
+
+    예: '261014', '20261014', '3-a.20261014-test-autorefined' → '261014'.
+    날짜가 없거나 서로 다른 날짜가 여럿이면 None.
+    (예전에는 이름의 마지막 6글자만 봐서, 이름이 날짜로 끝나지 않으면 원시 폴더를 못 찾았다)
+    """
+    found = set()
+    for token in DATE_TOKEN_RE.findall(folder_name):
+        if len(token) == 8:
+            if not token.startswith("20"):
+                continue
+            token = token[2:]
+        if _valid_yymmdd(token):
+            found.add(token)
+    if len(found) == 1:
+        return found.pop()
+    return None
 
 def ensure_unique_path_fast(dest: Path) -> Path:
     if not dest.exists():
@@ -175,18 +205,42 @@ def build_output_filename(
     return f"{yymmdd}-{stop}-{set_no}-{base}_{hm}_{nn}{ext}"
 
 
+def make_run_date_dir(out_root: Path, yymmdd: str) -> Path:
+    """이번 실행의 출력 날짜 폴더를 만들어 돌려준다.
+
+    출력/YYMMDD 가 없으면 그 이름, 있으면 YYMMDD_2, YYMMDD_3 … 중 첫 빈 이름.
+    실행할 때마다 새 폴더라서 같은 날짜를 여러 번 돌려도 결과가 한 폴더에 섞이지 않는다.
+    """
+    number = 1
+    while True:
+        name = yymmdd if number == 1 else f"{yymmdd}_{number}"
+        candidate = out_root / name
+        try:
+            candidate.mkdir(exist_ok=False)
+            return candidate
+        except FileExistsError:
+            number += 1
+
+
 def build_output_directory(
     out_root: Path,
     b_date_path: Path,
-    yymmdd: str,
+    date_folder: str,
     target: BFileTarget,
+    *,
+    by_camera: bool = False,
 ) -> Path:
-    if target.layout == "flat":
-        relative_parent = target.path.parent.relative_to(b_date_path)
-        return out_root / yymmdd / relative_parent
-    if target.nn is None:
-        raise ValueError("Legacy target is missing a camera number")
-    return out_root / yymmdd / target.nn
+    """출력 폴더 (date_folder 는 이번 실행의 날짜 폴더 이름: 261014, 261014_2 …).
+
+    by_camera=False(기본): B 안의 폴더 구조를 그대로 → 출력/261014/0001/0001/, 출력/261014/광고조명/1_halo형/
+    by_camera=True: 형식과 관계없이 카메라번호별 → 출력/261014/12/ (예전 지점 폴더 형식 동작)
+    """
+    if by_camera:
+        if target.nn is None:
+            raise ValueError("Target is missing a camera number")
+        return out_root / date_folder / target.nn
+    relative_parent = target.path.parent.relative_to(b_date_path)
+    return out_root / date_folder / relative_parent
 
 def build_hm_index_for_set(a_set_path: Path) -> Dict[str, str]:
     mapping: Dict[str, str] = {}
@@ -224,7 +278,38 @@ def build_hm_index_for_set(a_set_path: Path) -> Dict[str, str]:
                 mapping[nn] = val
     return mapping
 
+def looks_like_raw_date_dir(path: Path) -> bool:
+    """원시 날짜 폴더처럼 보이는지: NNNN/NNNN/ 또는 Single/NNNN/ 안에 *_High|Middle|Low_image_* 파일이 있으면 True.
+    컨버팅·자동정제 결과 폴더(image_02.png)와 구분하는 데 쓴다. 앞쪽 몇 개 폴더만 본다."""
+    try:
+        outers = sorted(
+            p for p in path.iterdir()
+            if p.is_dir() and (p.name.casefold() == "single" or VALID_STOP_RE.match(p.name))
+        )
+    except OSError:
+        return False
+    for outer in outers[:5]:
+        try:
+            sets = sorted(p for p in outer.iterdir() if p.is_dir() and VALID_SET_RE.match(p.name))
+        except OSError:
+            continue
+        for set_dir in sets[:3]:
+            try:
+                with os.scandir(set_dir) as it:
+                    if any(f.is_file() and RAW_RANGE_IMAGE_RE.search(f.name) for f in it):
+                        return True
+            except OSError:
+                continue
+    return False
+
+
 def find_a_date_dir(a_root: Path, target_yymmdd: str) -> Optional[Path]:
+    """A(원시 상위 폴더)에서 날짜가 target_yymmdd 인 원시 날짜 폴더를 찾는다.
+
+    후보: 이름 속 날짜(to_yymmdd)가 같은 폴더 + 예전 규칙(이름 속 숫자의 마지막 6자리)이 같은 폴더.
+    여럿이면 ① 원시처럼 보이는 폴더 ② 이름이 정확히 YYMMDD·20YYMMDD ③ 숫자 8자리 이름 ④ 이름순.
+    (시험 폴더처럼 1.원시·2.converted·3-a 자동정제가 같은 날짜 이름으로 한곳에 있어도 원시를 고른다)
+    """
     def digits(s: str) -> str:
         return "".join(ch for ch in s if ch.isdigit())
     cands: List[Path] = []
@@ -234,23 +319,24 @@ def find_a_date_dir(a_root: Path, target_yymmdd: str) -> Optional[Path]:
                 if not d.is_dir():
                     continue
                 ds = digits(d.name)
-                if len(ds) >= 6 and ds[-6:] == target_yymmdd:
+                if to_yymmdd(d.name) == target_yymmdd or (len(ds) >= 6 and ds[-6:] == target_yymmdd):
                     cands.append(Path(d.path))
     except FileNotFoundError:
         return None
     if not cands:
         return None
-    exact = [p for p in cands if p.name == target_yymmdd]
-    if exact:
-        return exact[0]
-    yyyymmdd = []
-    for p in cands:
-        ds = "".join(ch for ch in p.name if ch.isdigit())
-        if len(ds) == 8 and ds[-6:] == target_yymmdd:
-            yyyymmdd.append(p)
-    if yyyymmdd:
-        return sorted(yyyymmdd)[0]
-    return sorted(cands)[0]
+    exact_names = {target_yymmdd, "20" + target_yymmdd}
+
+    def rank(p: Path) -> Tuple[int, int, int, str]:
+        ds = digits(p.name)
+        return (
+            0 if looks_like_raw_date_dir(p) else 1,
+            0 if p.name in exact_names else 1,
+            0 if len(ds) == 8 and ds[-6:] == target_yymmdd else 1,
+            str(p),
+        )
+
+    return min(cands, key=rank)
 
 # -------- 안전 복사 -------- #
 def safe_copy2_atomic(src: Path, dst_final: Path) -> bool:
@@ -330,8 +416,13 @@ class App:
         # 모드 선택 (rename / copy) — 기본은 rename
         tk.Label(root, text="작업 모드").grid(row=3, column=0, sticky="e", padx=5, pady=5)
         self.mode_var = tk.StringVar(value="copy")
-        mode_combo = ttk.Combobox(root, textvariable=self.mode_var, values=["rename", "copy"], state="readonly", width=10)
-        mode_combo.grid(row=3, column=1, sticky="w", padx=5)
+        # 카메라번호별 폴더(체크) / B 폴더 구조 그대로(해제, 기본)
+        self.by_camera_var = tk.BooleanVar(value=False)
+        mode_frame = tk.Frame(root)
+        mode_frame.grid(row=3, column=1, sticky="w", padx=5)
+        mode_combo = ttk.Combobox(mode_frame, textvariable=self.mode_var, values=["rename", "copy"], state="readonly", width=10)
+        mode_combo.pack(side="left")
+        tk.Checkbutton(mode_frame, text="카메라번호별 폴더로 나누기", variable=self.by_camera_var).pack(side="left", padx=(16, 0))
 
         self.run_btn = tk.Button(root, text="실행", bg="lightgreen", width=20, command=self.run)
         self.run_btn.grid(row=4, column=1, pady=10)
@@ -354,6 +445,7 @@ class App:
 
         self._log_q = queue.Queue()
         self._stats = {}
+        self._started = 0.0
         self._work_thread: Optional[threading.Thread] = None
 
     def select_b(self):
@@ -369,8 +461,17 @@ class App:
         if folder: self.var_out.set(folder)
 
     def _append_log(self, message: str):
+        self._append_lines([message])
+
+    def _append_lines(self, lines: List[str]):
+        """로그 여러 줄을 한 번에 넣는다 (insert·see 한 번). 로그 창은 최근 LOG_MAX_LINES 줄만 남긴다"""
+        if not lines:
+            return
         self.log_text.configure(state="normal")
-        self.log_text.insert("end", message + "\n")
+        self.log_text.insert("end", "\n".join(lines) + "\n")
+        overflow = int(self.log_text.index("end-1c").split(".")[0]) - LOG_MAX_LINES
+        if overflow > 0:
+            self.log_text.delete("1.0", f"{overflow + 1}.0")
         self.log_text.see("end")
         self.log_text.configure(state="disabled")
 
@@ -378,99 +479,196 @@ class App:
         self._log_q.put(message)
 
     def _ui_tick(self):
+        """메인 스레드: 로그는 한 번에 UI_MAX_LINES_PER_TICK 줄까지만 넣고, 진행 막대·상태를 갱신한다"""
+        lines: List[str] = []
         try:
-            while True:
-                msg = self._log_q.get_nowait()
-                self._append_log(msg)
+            while len(lines) < UI_MAX_LINES_PER_TICK:
+                lines.append(self._log_q.get_nowait())
         except queue.Empty:
             pass
+        self._append_lines(lines)
         s = self._stats
-        if s.get("total", 0) > 0:
-            self.progress["maximum"] = s["total"]
+        elapsed = _format_elapsed(time.monotonic() - self._started)
+        total = s.get("total", 0)
+        if total > 0:
+            if str(self.progress.cget("mode")) != "determinate":
+                self.progress.stop()
+                self.progress.configure(mode="determinate")
+            self.progress["maximum"] = total
             self.progress["value"] = s["processed"]
             self.status_var.set(
-                f"진행: {s['processed']}/{s['total']} | 성공: {s['copied_ok']} | 스킵: {s['skipped']}"
+                f"진행: {s['processed']}/{total} | 성공: {s['copied_ok']} | 스킵: {s['skipped']} | 경과 {elapsed}"
             )
-        if s.get("done",False):
-            self._append_log("처리 완료!")
-            messagebox.showinfo("완료", f"완료: {s['copied_ok']} 성공 / {s['skipped']} 스킵")
-            self.run_btn.config(state="normal"); return
+        elif not s.get("done"):
+            self.status_var.set(f"파일 목록 확인 중… | 경과 {elapsed}")
+        # 완료·오류 창은 쌓인 로그를 다 보여 준 뒤에 띄운다
+        if s.get("done") and self._log_q.empty():
+            self.progress.stop()
+            self.run_btn.config(state="normal")
+            if s.get("error"):
+                self.status_var.set(f"멈춤: {s['error'].splitlines()[0]} | 경과 {elapsed}")
+                messagebox.showerror("오류", s["error"])
+                return
+            self.progress.configure(mode="determinate")
+            self.progress["value"] = self.progress["maximum"]
+            if s["copied_ok"] == 0 and s["skipped"] > 0:
+                self._append_log("처리 완료 — 만든 파일 없음 (전부 스킵)")
+                messagebox.showwarning(
+                    "확인",
+                    f"만든 파일이 없습니다 (스킵 {s['skipped']}개).\n\n"
+                    "A(원시 상위 폴더)가 원시 날짜 폴더(예: 20261014)를 담은 폴더인지 확인하세요.\n"
+                    "로그 첫 줄의 '원시 날짜 폴더(A)' 경로 안에 0001\\0001 같은 원시 이미지 폴더가 있어야 합니다.",
+                )
+                return
+            self._append_log(f"처리 완료! (출력: {s.get('run_dir', '')})")
+            messagebox.showinfo(
+                "완료",
+                f"완료: {s['copied_ok']} 성공 / {s['skipped']} 스킵 · 경과 {elapsed}\n출력: {s.get('run_dir', '')}",
+            )
+            return
         self.root.after(UI_TICK_MS, self._ui_tick)
 
     def run(self):
+        """메인 스레드에서는 경로·날짜만 확인하고(즉시 끝남), 목록 확인·처리는 작업 스레드에서 한다"""
         if self._work_thread and self._work_thread.is_alive():
-            messagebox.showwarning("진행 중", "이미 실행 중"); return  
+            messagebox.showwarning("진행 중", "이미 실행 중"); return
         b_date = Path(self.var_b.get()); a_root = Path(self.var_a_root.get()); out_root = Path(self.var_out.get())
         if not (b_date.is_dir() and a_root.is_dir() and out_root.is_dir()):
             messagebox.showerror("오류", "경로 확인"); return
-        yymmdd = to_yymmdd(b_date.name); a_date = find_a_date_dir(a_root, yymmdd)
-        if not a_date: messagebox.showerror("오류", "원시 날짜 폴더 없음"); return
-        files = list(list_all_b_files(b_date)); total = len(files)
-        if total==0: messagebox.showinfo("정보","처리할 파일 없음"); return
-        legacy_count = sum(target.layout == "legacy" for target in files)
-        flat_count = sum(target.layout == "flat" for target in files)
+        yymmdd = to_yymmdd(b_date.name)
+        if not yymmdd:
+            messagebox.showerror(
+                "오류",
+                f"B 폴더 이름에서 날짜(YYMMDD)를 찾지 못했습니다:\n{b_date.name}\n\n"
+                "폴더 이름에 날짜(예: 261014, 20261014)를 하나만 넣어 주세요.",
+            )
+            return
         operation_mode = self.mode_var.get()
+        by_camera = self.by_camera_var.get()  # Tk 변수는 메인 스레드에서만 읽는다
         self.log_text.configure(state="normal")
         self.log_text.delete("1.0", "end")
         self.log_text.configure(state="disabled")
-        self._stats={"total":total,"processed":0,"copied_ok":0,"skipped":0,"done":False}
-        self._append_log(
-            f"처리 시작... (기존 형식: {legacy_count}, 새 형식: {flat_count})"
-        )
-        def worker():
-            hm_cache: Dict[Path, Dict[str, str]] = {}
-            for target in files:
-                mode = target.mode
-                stop = target.stop
-                set_no = target.set_no
-                b_file = target.path
-                nn = target.nn
-                base = target.base
-                ext = target.ext
-                if nn is None or base is None or ext is None:
-                    self._stats["skipped"]+=1; self._stats["processed"]+=1
-                    self._log(f"[SKIP] 파일명 번호 추출 실패: {b_file}")
-                    continue
-                if mode=="single":
-                    a_single=_find_child_dir_casefold(a_date,"single") or (a_date/"Single")
-                    a_set=a_single/set_no
-                else: a_set=a_date/(stop or "0000")/set_no
-                mapping = hm_cache.get(a_set)
-                if mapping is None:
-                    mapping = build_hm_index_for_set(a_set)
-                    hm_cache[a_set] = mapping
-                hm=mapping.get(nn)
-                if hm is None:
-                    self._stats["skipped"]+=1; self._stats["processed"]+=1
-                    self._log(f"[SKIP] low/middle/high 매칭 실패: {b_file} (A: {a_set})")
-                    continue
-                new = build_output_filename(
-                    yymmdd, mode, stop, set_no, base, hm, nn, ext
-                )
-                out_dir = build_output_directory(
-                    out_root, b_date, yymmdd, target
-                )
-                out_dir.mkdir(parents=True, exist_ok=True)
-                dest = ensure_unique_path_fast(out_dir / new)
-                if operation_mode=="rename":
-                    try:
-                        b_file.rename(dest); self._stats["copied_ok"]+=1
-                        self._log(f"[RENAME] {b_file} -> {dest}")
-                    except Exception as e:
-                        self._stats["skipped"]+=1
-                        self._log(f"[SKIP] rename 실패: {b_file} -> {dest} ({e})")
-                else:
-                    ok=safe_copy2_atomic(b_file,dest)
-                    if ok:
-                        self._stats["copied_ok"]+=1
-                        self._log(f"[COPY] {b_file} -> {dest}")
-                    else:
-                        self._stats["skipped"]+=1
-                        self._log(f"[SKIP] copy 실패: {b_file} -> {dest}")
-                self._stats["processed"]+=1
-            self._stats["done"]=True
+        try:
+            while True:
+                self._log_q.get_nowait()  # 이전 실행에서 남은 줄 버리기
+        except queue.Empty:
+            pass
+        self._stats = {"total": 0, "processed": 0, "copied_ok": 0, "skipped": 0,
+                       "done": False, "error": "", "run_dir": ""}
+        self._started = time.monotonic()
+        self.progress.configure(mode="indeterminate", value=0)
+        self.progress.start(15)
+        self.status_var.set("파일 목록 확인 중…")
         self.run_btn.config(state="disabled")
-        self._work_thread=threading.Thread(target=worker,daemon=True); self._work_thread.start(); self._ui_tick()
+        self._work_thread = threading.Thread(
+            target=self._work,
+            args=(b_date, a_root, out_root, yymmdd, operation_mode, by_camera),
+            daemon=True,
+        )
+        self._work_thread.start()
+        self.root.after(UI_TICK_MS, self._ui_tick)
+
+    def _work(self, b_date: Path, a_root: Path, out_root: Path, yymmdd: str,
+              operation_mode: str, by_camera: bool) -> None:
+        """작업 스레드: 화면은 건드리지 않고 _stats 와 로그 queue 로만 알린다"""
+        s = self._stats
+        try:
+            a_date = find_a_date_dir(a_root, yymmdd)
+            if not a_date:
+                s["error"] = f"원시 날짜 폴더 없음 (날짜 {yymmdd})\nA: {a_root}"
+                return
+            self._log(f"날짜 {yymmdd} · 원시 날짜 폴더(A): {a_date}")
+            self._log("파일 목록 확인 중…")
+            files = list(list_all_b_files(b_date))
+            if not files:
+                s["error"] = f"처리할 파일 없음\nB: {b_date}"
+                return
+            run_dir = make_run_date_dir(out_root, yymmdd)
+            s["run_dir"] = str(run_dir)
+            legacy_count = sum(target.layout == "legacy" for target in files)
+            flat_count = sum(target.layout == "flat" for target in files)
+            self._log(
+                "출력 폴더: " + ("카메라번호별" if by_camera else "B 폴더 구조 그대로") + f" → {run_dir}"
+            )
+            self._log(
+                f"처리 시작... (기존 형식: {legacy_count}, 새 형식: {flat_count}, 모드: {operation_mode})"
+            )
+            s["total"] = len(files)
+            self._process(files, a_date, out_root, b_date, yymmdd, run_dir.name, operation_mode, by_camera)
+            if s["copied_ok"] == 0:
+                try:
+                    run_dir.rmdir()  # 하나도 못 만들었으면 빈 실행 폴더를 남기지 않는다 (비어 있을 때만 지워짐)
+                    s["run_dir"] = ""
+                    self._log(f"만든 파일이 없어 빈 출력 폴더를 지웠습니다: {run_dir}")
+                except OSError:
+                    pass
+        except Exception as exc:
+            s["error"] = f"처리 중 오류로 멈췄습니다: {exc}"
+            self._log(f"[ERROR] {exc}")
+        finally:
+            s["done"] = True
+
+    def _process(self, files: List[BFileTarget], a_date: Path, out_root: Path, b_date: Path,
+                 yymmdd: str, date_folder: str, operation_mode: str, by_camera: bool) -> None:
+        """작업 스레드: 파일마다 원시 H/M/L 을 찾아 새 이름으로 이번 실행 폴더(date_folder)에 복사·이동"""
+        hm_cache: Dict[Path, Dict[str, str]] = {}
+        for target in files:
+            mode = target.mode
+            stop = target.stop
+            set_no = target.set_no
+            b_file = target.path
+            nn = target.nn
+            base = target.base
+            ext = target.ext
+            if nn is None or base is None or ext is None:
+                self._stats["skipped"] += 1; self._stats["processed"] += 1
+                self._log(f"[SKIP] 파일명 번호 추출 실패: {b_file}")
+                continue
+            if mode == "single":
+                a_single = _find_child_dir_casefold(a_date, "single") or (a_date / "Single")
+                a_set = a_single / set_no
+            else:
+                a_set = a_date / (stop or "0000") / set_no
+            mapping = hm_cache.get(a_set)
+            if mapping is None:
+                mapping = build_hm_index_for_set(a_set)
+                hm_cache[a_set] = mapping
+            hm = mapping.get(nn)
+            if hm is None:
+                self._stats["skipped"] += 1; self._stats["processed"] += 1
+                self._log(f"[SKIP] low/middle/high 매칭 실패: {b_file} (A: {a_set})")
+                continue
+            new = build_output_filename(
+                yymmdd, mode, stop, set_no, base, hm, nn, ext
+            )
+            out_dir = build_output_directory(
+                out_root, b_date, date_folder, target, by_camera=by_camera
+            )
+            out_dir.mkdir(parents=True, exist_ok=True)
+            dest = ensure_unique_path_fast(out_dir / new)
+            if operation_mode == "rename":
+                try:
+                    b_file.rename(dest); self._stats["copied_ok"] += 1
+                    self._log(f"[RENAME] {b_file} -> {dest}")
+                except Exception as e:
+                    self._stats["skipped"] += 1
+                    self._log(f"[SKIP] rename 실패: {b_file} -> {dest} ({e})")
+            else:
+                ok = safe_copy2_atomic(b_file, dest)
+                if ok:
+                    self._stats["copied_ok"] += 1
+                    self._log(f"[COPY] {b_file} -> {dest}")
+                else:
+                    self._stats["skipped"] += 1
+                    self._log(f"[SKIP] copy 실패: {b_file} -> {dest}")
+            self._stats["processed"] += 1
+
+
+def _format_elapsed(seconds: float) -> str:
+    """경과 시간 m:ss"""
+    total = int(seconds)
+    return f"{total // 60}:{total % 60:02d}"
+
 
 def main():
     root=tk.Tk(); App(root); root.mainloop()
