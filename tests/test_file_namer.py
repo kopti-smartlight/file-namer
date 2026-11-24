@@ -17,6 +17,7 @@ parse_flat_b_file = file_namer.parse_flat_b_file
 to_yymmdd = file_namer.to_yymmdd
 find_a_date_dir = file_namer.find_a_date_dir
 looks_like_raw_date_dir = file_namer.looks_like_raw_date_dir
+make_run_date_dir = file_namer.make_run_date_dir
 
 
 def _touch(path: Path) -> None:
@@ -213,3 +214,27 @@ def test_find_a_date_dir_without_raw_images_uses_old_order(tmp_path: Path) -> No
     (tmp_path / "x261014").mkdir()
     (tmp_path / "261014").mkdir()
     assert find_a_date_dir(tmp_path, "261014") == tmp_path / "261014"
+
+
+def test_make_run_date_dir_gives_each_run_its_own_folder(tmp_path: Path) -> None:
+    # 같은 출력 폴더에 같은 날짜를 여러 번 돌려도 결과가 한 폴더에 섞이지 않게 실행마다 새 폴더
+    first = make_run_date_dir(tmp_path, "261014")
+    second = make_run_date_dir(tmp_path, "261014")
+    (tmp_path / "261014_3").mkdir()  # 사용자가 만든 같은 이름 폴더가 있으면 건너뛴다
+    fourth = make_run_date_dir(tmp_path, "261014")
+    other_date = make_run_date_dir(tmp_path, "261015")
+    assert first == tmp_path / "261014" and first.is_dir()
+    assert second == tmp_path / "261014_2" and second.is_dir()
+    assert fourth == tmp_path / "261014_4"
+    assert other_date == tmp_path / "261015"
+
+
+def test_output_directory_uses_this_runs_folder_name(tmp_path: Path) -> None:
+    b_date = tmp_path / "3-a.20261014-test-autorefined"
+    target = BFileTarget(
+        layout="legacy", mode="multi", stop="0001", set_no="0001",
+        path=b_date / "0001" / "0001" / "image_01.png", nn="01", base="image", ext=".png",
+    )
+    out = tmp_path / "out"
+    assert build_output_directory(out, b_date, "261014_2", target) == out / "261014_2" / "0001" / "0001"
+    assert build_output_directory(out, b_date, "261014_2", target, by_camera=True) == out / "261014_2" / "01"
