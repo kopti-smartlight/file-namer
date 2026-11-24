@@ -97,7 +97,8 @@ def test_build_output_filename_preserves_existing_format() -> None:
     ) == "260806-0006-image_M_12.png"
 
 
-def test_output_directory_depends_on_detected_layout(tmp_path: Path) -> None:
+def test_output_directory_keeps_b_structure_unless_camera_sorting(tmp_path: Path) -> None:
+    # 기본(체크 해제): 두 형식 모두 B 안의 폴더 구조 그대로. 체크: 카메라번호별 (예전 지점 폴더 형식 동작)
     b_date = tmp_path / "20260610"
     out_root = tmp_path / "output"
     flat_file = (
@@ -125,7 +126,31 @@ def test_output_directory_depends_on_detected_layout(tmp_path: Path) -> None:
     ) == out_root / "260610" / "2_내조형" / "nested"
     assert build_output_directory(
         out_root, b_date, "260610", legacy_target
+    ) == out_root / "260610" / "0001" / "0006"
+
+    assert build_output_directory(
+        out_root, b_date, "260610", flat_target, by_camera=True
     ) == out_root / "260610" / "12"
+    assert build_output_directory(
+        out_root, b_date, "260610", legacy_target, by_camera=True
+    ) == out_root / "260610" / "12"
+
+
+def test_output_directory_keeps_single_folder(tmp_path: Path) -> None:
+    b_date = tmp_path / "261014"
+    single_target = BFileTarget(
+        layout="legacy",
+        mode="single",
+        stop=None,
+        set_no="0008",
+        path=b_date / "Single" / "0008" / "image_12.png",
+        nn="12",
+        base="image",
+        ext=".png",
+    )
+    assert build_output_directory(
+        tmp_path / "out", b_date, "261014", single_target
+    ) == tmp_path / "out" / "261014" / "Single" / "0008"
 
 
 def test_to_yymmdd_reads_date_anywhere_in_folder_name() -> None:

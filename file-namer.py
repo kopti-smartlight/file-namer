@@ -206,13 +206,20 @@ def build_output_directory(
     b_date_path: Path,
     yymmdd: str,
     target: BFileTarget,
+    *,
+    by_camera: bool = False,
 ) -> Path:
-    if target.layout == "flat":
-        relative_parent = target.path.parent.relative_to(b_date_path)
-        return out_root / yymmdd / relative_parent
-    if target.nn is None:
-        raise ValueError("Legacy target is missing a camera number")
-    return out_root / yymmdd / target.nn
+    """출력 폴더.
+
+    by_camera=False(기본): B 안의 폴더 구조를 그대로 → 출력/YYMMDD/0001/0001/, 출력/YYMMDD/광고조명/1_halo형/
+    by_camera=True: 형식과 관계없이 카메라번호별 → 출력/YYMMDD/12/ (예전 지점 폴더 형식 동작)
+    """
+    if by_camera:
+        if target.nn is None:
+            raise ValueError("Target is missing a camera number")
+        return out_root / yymmdd / target.nn
+    relative_parent = target.path.parent.relative_to(b_date_path)
+    return out_root / yymmdd / relative_parent
 
 def build_hm_index_for_set(a_set_path: Path) -> Dict[str, str]:
     mapping: Dict[str, str] = {}
@@ -388,8 +395,13 @@ class App:
         # 모드 선택 (rename / copy) — 기본은 rename
         tk.Label(root, text="작업 모드").grid(row=3, column=0, sticky="e", padx=5, pady=5)
         self.mode_var = tk.StringVar(value="copy")
-        mode_combo = ttk.Combobox(root, textvariable=self.mode_var, values=["rename", "copy"], state="readonly", width=10)
-        mode_combo.grid(row=3, column=1, sticky="w", padx=5)
+        # 카메라번호별 폴더(체크) / B 폴더 구조 그대로(해제, 기본)
+        self.by_camera_var = tk.BooleanVar(value=False)
+        mode_frame = tk.Frame(root)
+        mode_frame.grid(row=3, column=1, sticky="w", padx=5)
+        mode_combo = ttk.Combobox(mode_frame, textvariable=self.mode_var, values=["rename", "copy"], state="readonly", width=10)
+        mode_combo.pack(side="left")
+        tk.Checkbutton(mode_frame, text="카메라번호별 폴더로 나누기", variable=self.by_camera_var).pack(side="left", padx=(16, 0))
 
         self.run_btn = tk.Button(root, text="실행", bg="lightgreen", width=20, command=self.run)
         self.run_btn.grid(row=4, column=1, pady=10)
@@ -478,11 +490,13 @@ class App:
         legacy_count = sum(target.layout == "legacy" for target in files)
         flat_count = sum(target.layout == "flat" for target in files)
         operation_mode = self.mode_var.get()
+        by_camera = self.by_camera_var.get()  # Tk 변수는 메인 스레드에서만 읽는다
         self.log_text.configure(state="normal")
         self.log_text.delete("1.0", "end")
         self.log_text.configure(state="disabled")
         self._stats={"total":total,"processed":0,"copied_ok":0,"skipped":0,"done":False}
         self._append_log(f"날짜 {yymmdd} · 원시 날짜 폴더(A): {a_date}")
+        self._append_log("출력 폴더: " + ("카메라번호별" if by_camera else "B 폴더 구조 그대로"))
         self._append_log(
             f"처리 시작... (기존 형식: {legacy_count}, 새 형식: {flat_count})"
         )
@@ -517,7 +531,7 @@ class App:
                     yymmdd, mode, stop, set_no, base, hm, nn, ext
                 )
                 out_dir = build_output_directory(
-                    out_root, b_date, yymmdd, target
+                    out_root, b_date, yymmdd, target, by_camera=by_camera
                 )
                 out_dir.mkdir(parents=True, exist_ok=True)
                 dest = ensure_unique_path_fast(out_dir / new)
