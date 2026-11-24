@@ -14,6 +14,9 @@ build_output_directory = file_namer.build_output_directory
 build_output_filename = file_namer.build_output_filename
 list_all_b_files = file_namer.list_all_b_files
 parse_flat_b_file = file_namer.parse_flat_b_file
+to_yymmdd = file_namer.to_yymmdd
+find_a_date_dir = file_namer.find_a_date_dir
+looks_like_raw_date_dir = file_namer.looks_like_raw_date_dir
 
 
 def _touch(path: Path) -> None:
@@ -123,3 +126,65 @@ def test_output_directory_depends_on_detected_layout(tmp_path: Path) -> None:
     assert build_output_directory(
         out_root, b_date, "260610", legacy_target
     ) == out_root / "260610" / "12"
+
+
+def test_to_yymmdd_reads_date_anywhere_in_folder_name() -> None:
+    # 예전에는 이름의 마지막 6글자만 봐서 '3-a.20261014-test-autorefined' 같은 B 폴더에서 멈췄다
+    assert to_yymmdd("261014") == "261014"
+    assert to_yymmdd("20261014") == "261014"
+    assert to_yymmdd("3-a.20261014-test-autorefined") == "261014"
+    assert to_yymmdd("3-b.20261014-test-autorefined-조명종류별분류") == "261014"
+    assert to_yymmdd("1.20261014-test-원시") == "261014"
+    assert to_yymmdd("자동정제_261014_v2") == "261014"
+    assert to_yymmdd("20261014_261014") == "261014"  # 같은 날짜가 두 번이면 괜찮다
+
+
+def test_to_yymmdd_rejects_missing_or_ambiguous_dates() -> None:
+    assert to_yymmdd("autorefined") is None
+    assert to_yymmdd("0001") is None
+    assert to_yymmdd("20261014-20261015") is None  # 서로 다른 날짜 둘
+    assert to_yymmdd("261399") is None  # 13월은 날짜가 아님
+    assert to_yymmdd("120261014") is None  # 숫자 9자리 덩어리
+
+
+def _make_raw_date_dir(date_dir: Path) -> None:
+    _touch(date_dir / "0001" / "gps.db")
+    _touch(date_dir / "0001" / "0001" / "Focus 10_Middle_image_02.png")
+
+
+def _make_converted_date_dir(date_dir: Path) -> None:
+    _touch(date_dir / "0001" / "gps.db")
+    _touch(date_dir / "0001" / "0001" / "image_02.png")
+
+
+def test_looks_like_raw_date_dir(tmp_path: Path) -> None:
+    _make_raw_date_dir(tmp_path / "raw")
+    _make_converted_date_dir(tmp_path / "converted")
+    _touch(tmp_path / "single_raw" / "Single" / "0003" / "Focus 10_High_image_12.png")
+    assert looks_like_raw_date_dir(tmp_path / "raw")
+    assert looks_like_raw_date_dir(tmp_path / "single_raw")
+    assert not looks_like_raw_date_dir(tmp_path / "converted")
+    assert not looks_like_raw_date_dir(tmp_path / "없음")
+
+
+def test_find_a_date_dir_prefers_raw_among_same_date_folders(tmp_path: Path) -> None:
+    # 시험 폴더처럼 같은 날짜 이름의 단계별 폴더가 한곳에 있을 때 원시를 고른다
+    _make_converted_date_dir(tmp_path / "2.20261014-test-converted")
+    _make_converted_date_dir(tmp_path / "3-a.20261014-test-autorefined")
+    _make_raw_date_dir(tmp_path / "원시_20261014")  # 이름순으로는 뒤
+    _touch(tmp_path / "261014" / "광고조명" / "x.png")  # 이름만 날짜인 자동정제 결과
+    assert find_a_date_dir(tmp_path, "261014") == tmp_path / "원시_20261014"
+
+
+def test_find_a_date_dir_keeps_plain_date_layout(tmp_path: Path) -> None:
+    # NAS 01_원시데이터/동적 처럼 날짜 이름 폴더만 있는 경우는 예전과 같다
+    _make_raw_date_dir(tmp_path / "20261014")
+    _make_raw_date_dir(tmp_path / "20261015")
+    assert find_a_date_dir(tmp_path, "261014") == tmp_path / "20261014"
+    assert find_a_date_dir(tmp_path, "261016") is None
+
+
+def test_find_a_date_dir_without_raw_images_uses_old_order(tmp_path: Path) -> None:
+    (tmp_path / "x261014").mkdir()
+    (tmp_path / "261014").mkdir()
+    assert find_a_date_dir(tmp_path, "261014") == tmp_path / "261014"

@@ -23,6 +23,10 @@ FLAT_B_FILE_RE = re.compile(
 
 VALID_STOP_RE = re.compile(r"^\d{4}$")
 VALID_SET_RE  = re.compile(r"^\d{4}$")
+# 폴더 이름 속 날짜 덩어리: 앞뒤가 숫자가 아닌 8자리(20YYMMDD) 또는 6자리(YYMMDD)
+DATE_TOKEN_RE = re.compile(r"(?<!\d)(\d{8}|\d{6})(?!\d)")
+# 원시 이미지 이름(Focus 10_Middle_image_02.png): 컨버팅·자동정제 결과(image_02.png)에는 High/Middle/Low 가 없다
+RAW_RANGE_IMAGE_RE = re.compile(r"_(?:high|middle|low)_image_", re.IGNORECASE)
 
 # -------- 옵션 -------- #
 RETRY_MAX = 3
@@ -52,8 +56,30 @@ class BFileTarget:
 def is_date_folder(name: str) -> bool:
     return bool(re.fullmatch(r"\d{6}|\d{8}", name))
 
-def to_yymmdd(date_folder_name: str) -> str:
-    return date_folder_name[-6:]
+
+def _valid_yymmdd(yymmdd: str) -> bool:
+    month, day = int(yymmdd[2:4]), int(yymmdd[4:6])
+    return 1 <= month <= 12 and 1 <= day <= 31
+
+
+def to_yymmdd(folder_name: str) -> Optional[str]:
+    """폴더 이름 속 날짜(20YYMMDD·YYMMDD 덩어리)를 YYMMDD 로 돌려준다.
+
+    예: '261014', '20261014', '3-a.20261014-test-autorefined' → '261014'.
+    날짜가 없거나 서로 다른 날짜가 여럿이면 None.
+    (예전에는 이름의 마지막 6글자만 봐서, 이름이 날짜로 끝나지 않으면 원시 폴더를 못 찾았다)
+    """
+    found = set()
+    for token in DATE_TOKEN_RE.findall(folder_name):
+        if len(token) == 8:
+            if not token.startswith("20"):
+                continue
+            token = token[2:]
+        if _valid_yymmdd(token):
+            found.add(token)
+    if len(found) == 1:
+        return found.pop()
+    return None
 
 def ensure_unique_path_fast(dest: Path) -> Path:
     if not dest.exists():
@@ -224,7 +250,38 @@ def build_hm_index_for_set(a_set_path: Path) -> Dict[str, str]:
                 mapping[nn] = val
     return mapping
 
+def looks_like_raw_date_dir(path: Path) -> bool:
+    """원시 날짜 폴더처럼 보이는지: NNNN/NNNN/ 또는 Single/NNNN/ 안에 *_High|Middle|Low_image_* 파일이 있으면 True.
+    컨버팅·자동정제 결과 폴더(image_02.png)와 구분하는 데 쓴다. 앞쪽 몇 개 폴더만 본다."""
+    try:
+        outers = sorted(
+            p for p in path.iterdir()
+            if p.is_dir() and (p.name.casefold() == "single" or VALID_STOP_RE.match(p.name))
+        )
+    except OSError:
+        return False
+    for outer in outers[:5]:
+        try:
+            sets = sorted(p for p in outer.iterdir() if p.is_dir() and VALID_SET_RE.match(p.name))
+        except OSError:
+            continue
+        for set_dir in sets[:3]:
+            try:
+                with os.scandir(set_dir) as it:
+                    if any(f.is_file() and RAW_RANGE_IMAGE_RE.search(f.name) for f in it):
+                        return True
+            except OSError:
+                continue
+    return False
+
+
 def find_a_date_dir(a_root: Path, target_yymmdd: str) -> Optional[Path]:
+    """A(원시 상위 폴더)에서 날짜가 target_yymmdd 인 원시 날짜 폴더를 찾는다.
+
+    후보: 이름 속 날짜(to_yymmdd)가 같은 폴더 + 예전 규칙(이름 속 숫자의 마지막 6자리)이 같은 폴더.
+    여럿이면 ① 원시처럼 보이는 폴더 ② 이름이 정확히 YYMMDD·20YYMMDD ③ 숫자 8자리 이름 ④ 이름순.
+    (시험 폴더처럼 1.원시·2.converted·3-a 자동정제가 같은 날짜 이름으로 한곳에 있어도 원시를 고른다)
+    """
     def digits(s: str) -> str:
         return "".join(ch for ch in s if ch.isdigit())
     cands: List[Path] = []
@@ -234,23 +291,24 @@ def find_a_date_dir(a_root: Path, target_yymmdd: str) -> Optional[Path]:
                 if not d.is_dir():
                     continue
                 ds = digits(d.name)
-                if len(ds) >= 6 and ds[-6:] == target_yymmdd:
+                if to_yymmdd(d.name) == target_yymmdd or (len(ds) >= 6 and ds[-6:] == target_yymmdd):
                     cands.append(Path(d.path))
     except FileNotFoundError:
         return None
     if not cands:
         return None
-    exact = [p for p in cands if p.name == target_yymmdd]
-    if exact:
-        return exact[0]
-    yyyymmdd = []
-    for p in cands:
-        ds = "".join(ch for ch in p.name if ch.isdigit())
-        if len(ds) == 8 and ds[-6:] == target_yymmdd:
-            yyyymmdd.append(p)
-    if yyyymmdd:
-        return sorted(yyyymmdd)[0]
-    return sorted(cands)[0]
+    exact_names = {target_yymmdd, "20" + target_yymmdd}
+
+    def rank(p: Path) -> Tuple[int, int, int, str]:
+        ds = digits(p.name)
+        return (
+            0 if looks_like_raw_date_dir(p) else 1,
+            0 if p.name in exact_names else 1,
+            0 if len(ds) == 8 and ds[-6:] == target_yymmdd else 1,
+            str(p),
+        )
+
+    return min(cands, key=rank)
 
 # -------- 안전 복사 -------- #
 def safe_copy2_atomic(src: Path, dst_final: Path) -> bool:
@@ -403,8 +461,18 @@ class App:
         b_date = Path(self.var_b.get()); a_root = Path(self.var_a_root.get()); out_root = Path(self.var_out.get())
         if not (b_date.is_dir() and a_root.is_dir() and out_root.is_dir()):
             messagebox.showerror("오류", "경로 확인"); return
-        yymmdd = to_yymmdd(b_date.name); a_date = find_a_date_dir(a_root, yymmdd)
-        if not a_date: messagebox.showerror("오류", "원시 날짜 폴더 없음"); return
+        yymmdd = to_yymmdd(b_date.name)
+        if not yymmdd:
+            messagebox.showerror(
+                "오류",
+                f"B 폴더 이름에서 날짜(YYMMDD)를 찾지 못했습니다:\n{b_date.name}\n\n"
+                "폴더 이름에 날짜(예: 261014, 20261014)를 하나만 넣어 주세요.",
+            )
+            return
+        a_date = find_a_date_dir(a_root, yymmdd)
+        if not a_date:
+            messagebox.showerror("오류", f"원시 날짜 폴더 없음 (날짜 {yymmdd})\nA: {a_root}")
+            return
         files = list(list_all_b_files(b_date)); total = len(files)
         if total==0: messagebox.showinfo("정보","처리할 파일 없음"); return
         legacy_count = sum(target.layout == "legacy" for target in files)
@@ -414,6 +482,7 @@ class App:
         self.log_text.delete("1.0", "end")
         self.log_text.configure(state="disabled")
         self._stats={"total":total,"processed":0,"copied_ok":0,"skipped":0,"done":False}
+        self._append_log(f"날짜 {yymmdd} · 원시 날짜 폴더(A): {a_date}")
         self._append_log(
             f"처리 시작... (기존 형식: {legacy_count}, 새 형식: {flat_count})"
         )
